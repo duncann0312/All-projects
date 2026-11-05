@@ -12,8 +12,10 @@
 #     be unique -> checked and reported.
 #
 # Stage 2 - Renewal status
-#   * Year of account (YOA) is held in characters 4-5 of the reference
-#     ("25" expiring -> "26" current). The rest of the reference is unchanged.
+#   * Year of account (YOA) is held in characters 4-5 of the reference.
+#     A renewal carries the same reference with the YOA rolled forward by one
+#     (e.g. "24" -> "25", "25" -> "26"); the rest is unchanged. Each reference
+#     is rolled from its own YOA, so the expiring set may mix years.
 #   * Expiring records -> Renewed / Lapsed
 #   * Current records  -> Renewal / New
 #
@@ -49,10 +51,12 @@ cfg <- list(
     binder      = "Binder Declaration"
   ),
 
-  # Year-of-account position in the reference and the two YOA codes
+  # Year-of-account position in the reference. Renewal = YOA + 1.
   yoa_pos      = c(4L, 5L),
-  expiring_yoa = "25",
-  current_yoa  = "26",
+  # YOAs expected in each set - used only for the data check (references
+  # outside these are flagged but still matched on YOA + 1)
+  expiring_yoa = c("24", "25"),
+  current_yoa  = c("25", "26"),
 
   # Limit bands for the binder Dec profile (upper bound inclusive)
   limit_breaks = c(0, 5e5, 1e6, 2.5e6, 5e6, 1e7, Inf)
@@ -78,14 +82,15 @@ clean_num <- function(x) {
   as.numeric(gsub("[^0-9.eE-]", "", as.character(x)))   # strips commas, currency
 }
 
-# Replace the YOA characters in a reference. Returns NA where the reference is
-# missing, too short, or does not carry the expected 'from' YOA.
-swap_yoa <- function(ref, from, to, pos) {
+# Roll the 2-digit YOA in a reference by 'by' years (+1 = renewal reference,
+# -1 = prior-year reference). Returns NA where the reference is missing, too
+# short, or the YOA characters are not two digits.
+shift_yoa <- function(ref, by, pos) {
   out <- rep(NA_character_, length(ref))
-  ok  <- !is.na(ref) & nchar(ref) >= pos[2] & substr(ref, pos[1], pos[2]) == from
-  ok[is.na(ok)] <- FALSE
+  yoa <- substr(ref, pos[1], pos[2])
+  ok  <- !is.na(ref) & nchar(ref) >= pos[2] & grepl("^[0-9]{2}$", yoa)
   x <- ref[ok]
-  substr(x, pos[1], pos[2]) <- to
+  substr(x, pos[1], pos[2]) <- sprintf("%02d", (as.integer(yoa[ok]) + by) %% 100)
   out[ok] <- x
   out
 }
@@ -171,10 +176,10 @@ validate_dataset <- function(df, label, expected_yoa, cfg) {
   # YOA characters on the record key (policy_ref, or master_ref for binders)
   key <- ifelse(is_b, df$master_ref, df$policy_ref)
   yoa <- substr(key, cfg$yoa_pos[1], cfg$yoa_pos[2])
-  bad <- which((!is_b | first) & !is.na(key) & yoa != expected_yoa)
+  bad <- which((!is_b | first) & !is.na(key) & !yoa %in% expected_yoa)
   add("Unexpected year of account in reference", bad,
       paste0("Chars ", cfg$yoa_pos[1], "-", cfg$yoa_pos[2], " = '", yoa[bad],
-             "', expected '", expected_yoa, "'"))
+             "', expected ", paste(expected_yoa, collapse = " or ")))
 
   # Numeric fields
   add("Missing or non-positive limit", which(is.na(df$limit) | df$limit <= 0))
@@ -237,8 +242,7 @@ classify <- function(con_exp, con_cur, cfg) {
   p <- cfg$yoa_pos
 
   # Expiring -> Renewed / Lapsed
-  con_exp$expected_renewal_ref <- swap_yoa(con_exp$policy_ref, cfg$expiring_yoa,
-                                           cfg$current_yoa, p)
+  con_exp$expected_renewal_ref <- shift_yoa(con_exp$policy_ref, 1, p)
   con_exp$status <- ifelse(is.na(con_exp$expected_renewal_ref), STATUS$unclass,
                     ifelse(con_exp$expected_renewal_ref %in% con_cur$policy_ref,
                            STATUS$renewed, STATUS$lapsed))
@@ -246,8 +250,7 @@ classify <- function(con_exp, con_cur, cfg) {
   con_exp$renewal_gn_premium <- con_cur$gn_premium[mc]
 
   # Current -> Renewal / New
-  con_cur$prior_ref <- swap_yoa(con_cur$policy_ref, cfg$current_yoa,
-                                cfg$expiring_yoa, p)
+  con_cur$prior_ref <- shift_yoa(con_cur$policy_ref, -1, p)
   con_cur$status <- ifelse(is.na(con_cur$prior_ref), STATUS$unclass,
                     ifelse(con_cur$prior_ref %in% con_exp$policy_ref,
                            STATUS$renewal, STATUS$new))
@@ -303,7 +306,7 @@ reconcile <- function(cls) {
 compare_profiles <- function(prof_exp, prof_cur, cfg) {
   if (is.null(prof_exp) || is.null(prof_cur)) return(NULL)
   pe <- prof_exp
-  pe$current_master_ref <- swap_yoa(pe$master_ref, cfg$expiring_yoa, cfg$current_yoa, cfg$yoa_pos)
+  pe$current_master_ref <- shift_yoa(pe$master_ref, 1, cfg$yoa_pos)
   pe <- pe[pe$current_master_ref %in% prof_cur$master_ref, ]
   pc <- prof_cur[prof_cur$master_ref %in% pe$current_master_ref, ]
   if (!nrow(pe)) return(NULL)
@@ -314,7 +317,7 @@ compare_profiles <- function(prof_exp, prof_cur, cfg) {
   m <- merge(pe, pc, by = c("current_master_ref", "limit_band"), all = TRUE)
   for (v in c("n_decs_expiring", "gn_premium_expiring", "n_decs_current", "gn_premium_current"))
     m[[v]][is.na(m[[v]])] <- 0
-  m$expiring_master_ref <- swap_yoa(m$current_master_ref, cfg$current_yoa, cfg$expiring_yoa, cfg$yoa_pos)
+  m$expiring_master_ref <- shift_yoa(m$current_master_ref, -1, cfg$yoa_pos)
   m$premium_change <- m$gn_premium_current - m$gn_premium_expiring
   m$limit_band <- factor(as.character(m$limit_band), levels = levels(prof_exp$limit_band))
   m <- m[order(m$current_master_ref, m$limit_band),
@@ -384,7 +387,6 @@ write_outputs <- function(res, dir) {
 make_dummy_data <- function(cfg, seed = 2026) {
   set.seed(seed)
   tl  <- cfg$type_labels
-  ey  <- cfg$expiring_yoa; cy <- cfg$current_yoa
   lims <- c(2.5e5, 5e5, 1e6, 2e6, 5e6, 1e7, 2.5e7, 5e7)
   # Reference format: 3-char prefix + 2-char YOA (chars 4-5) + 5-digit number
   mk_ref <- function(prefix, yoa, idx) sprintf("%s%s%05d", prefix, yoa, idx)
@@ -414,30 +416,30 @@ make_dummy_data <- function(cfg, seed = 2026) {
     do.call(rbind, out)
   }
 
-  # --- Expiring (YOA 25)
-  exp_ind <- rbind(mk_ind("OMK", tl$open_market, ey, 1:30),
-                   mk_ind("LSD", tl$lineslip,    ey, 1:15),
-                   mk_ind("BLK", tl$block,       ey, 1:10))
-  exp_masters <- mk_ref("BDM", ey, 1:4)
-  expiring <- rbind(exp_ind, mk_binders(exp_masters, ey))
+  # --- Expiring: mostly YOA 25; block entries and binder master 2 are YOA 24
+  exp_ind <- rbind(mk_ind("OMK", tl$open_market, "25", 1:30),
+                   mk_ind("LSD", tl$lineslip,    "25", 1:15),
+                   mk_ind("BLK", tl$block,       "24", 1:10))
+  exp_masters <- c(mk_ref("BDM", "25", 1), mk_ref("BDM", "24", 2),
+                   mk_ref("BDM", "25", 3:4))
+  expiring <- rbind(exp_ind, mk_binders(exp_masters, "25"))
 
-  # --- Current (YOA 26): ~75% of individual policies renew, plus new business
+  # --- Current: ~75% of individual policies renew at YOA + 1 (25->26, 24->25)
   ren <- exp_ind[runif(nrow(exp_ind)) < 0.75, ]
-  substr(ren$policy_ref, 4, 5) <- cy
+  ren$policy_ref <- shift_yoa(ren$policy_ref, 1, cfg$yoa_pos)
   ren$gn_premium <- round(ren$gn_premium * runif(nrow(ren), 0.9, 1.15))
-  new_ind <- rbind(mk_ind("OMK", tl$open_market, cy, 101:108),
-                   mk_ind("LSD", tl$lineslip,    cy, 101:104),
-                   mk_ind("BLK", tl$block,       cy, 101:103))
-  # Binders: masters 1-3 renew, master 4 lapses, one new master
-  cur_masters <- c(swap_yoa(exp_masters[1:3], ey, cy, cfg$yoa_pos), mk_ref("BDM", cy, 10))
-  current <- rbind(ren, new_ind, mk_binders(cur_masters, cy, start = 1))
+  new_ind <- rbind(mk_ind("OMK", tl$open_market, "26", 101:108),
+                   mk_ind("LSD", tl$lineslip,    "26", 101:104),
+                   mk_ind("BLK", tl$block,       "25", 101:103))
+  # Binders: masters 1-3 renew (incl. 24 -> 25), master 4 lapses, one new master
+  cur_masters <- c(shift_yoa(exp_masters[1:3], 1, cfg$yoa_pos), mk_ref("BDM", "26", 10))
+  current <- rbind(ren, new_ind, mk_binders(cur_masters, "26", start = 1))
 
   # --- Deliberate data issues so the checks have something to find
-  expiring$policy_ref[5] <- mk_ref("OMK", "24", 5)                  # wrong YOA
+  expiring$policy_ref[5] <- mk_ref("OMK", "23", 5)                  # unexpected YOA
   current <- rbind(current, current[1, ])                           # duplicate ref
   current$master_ref[which(current$policy_type == tl$binder)[1]] <- NA  # no master
   ls_ren <- which(current$policy_type == tl$lineslip &
-                  substr(current$policy_ref, 4, 5) == cy &
                   as.integer(substr(current$policy_ref, 6, 10)) < 100)[1]
   current$policy_type[ls_ren] <- tl$open_market                     # type change
 
