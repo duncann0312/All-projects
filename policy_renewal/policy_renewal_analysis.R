@@ -10,6 +10,9 @@
 #     Each binder master then becomes ONE record (key = master_ref).
 #   * All other types are individual records keyed on policy_ref, which must
 #     be unique -> checked and reported.
+#   * Optional fields (cfg$optional_cols) are carried through to the outputs:
+#     stack_code (blank for binder masters), deductible (average of decs for
+#     binders) and participation (average of decs for binders).
 #
 # Stage 2 - Renewal status
 #   * Year of account (YOA) is held in characters 4-5 of the reference.
@@ -41,6 +44,18 @@ cfg <- list(
     policy_type = "policy_type",
     limit       = "limit",
     gn_premium  = "gn_premium"
+  ),
+
+  # OPTIONAL fields carried through to the outputs.
+  #   col    = column name in YOUR data (if absent, the field is left blank)
+  #   type   = "text" or "numeric"
+  #   binder = how binder declarations roll up to the master / Dec profile band:
+  #            "blank", "mean", "sum", "max" or "first"
+  # Delete an entry to drop the field from the outputs; add entries for more.
+  optional_cols = list(
+    stack_code    = list(col = "stack_code",    type = "text",    binder = "blank"),
+    deductible    = list(col = "deductible",    type = "numeric", binder = "mean"),
+    participation = list(col = "participation", type = "numeric", binder = "mean")
   ),
 
   # Values of the policy-type field in YOUR data
@@ -116,8 +131,20 @@ band_limit <- function(limit, breaks) {
 
 sum_na <- function(x) sum(x, na.rm = TRUE)
 
+# Roll up an optional field across binder declarations
+rollup <- function(x, rule) {
+  if (all(is.na(x))) return(x[NA_integer_])
+  switch(rule,
+         blank = x[NA_integer_],
+         mean  = mean(x, na.rm = TRUE),
+         sum   = sum(x, na.rm = TRUE),
+         max   = max(x, na.rm = TRUE),
+         first = x[!is.na(x)][1],
+         stop("Unknown binder roll-up rule: ", rule))
+}
+
 # ---- 2. STANDARDISE INPUT ---------------------------------------------------
-standardise <- function(df, cfg) {
+standardise <- function(df, cfg, label = "") {
   src <- cfg$col_map
   missing_cols <- setdiff(src, names(df))
   if (length(missing_cols))
@@ -128,7 +155,23 @@ standardise <- function(df, cfg) {
   df$policy_type <- trimws(as.character(df$policy_type))
   df$limit       <- clean_num(df$limit)
   df$gn_premium  <- clean_num(df$gn_premium)
-  df$row_id      <- seq_len(nrow(df))
+
+  for (nm in names(cfg$optional_cols)) {
+    o <- cfg$optional_cols[[nm]]
+    if (o$col %in% names(df)) {
+      v <- df[[o$col]]
+    } else {
+      message(label, ": optional column '", o$col, "' not found - left blank")
+      v <- rep(NA, nrow(df))
+    }
+    if (o$type == "numeric") {
+      v <- clean_num(v)
+    } else {
+      v <- trimws(as.character(v)); v[v %in% ""] <- NA_character_
+    }
+    df[[nm]] <- v
+  }
+  df$row_id <- seq_len(nrow(df))
   df
 }
 
@@ -199,6 +242,16 @@ build_dec_profile <- function(df, cfg, label) {
   b$total_limit <- b$limit
   prof <- aggregate(cbind(n_decs, total_limit, gn_premium) ~ master_ref + limit_band,
                     data = b, FUN = sum_na, na.action = na.pass)
+  # Optional numeric fields rolled up per band, e.g. mean_deductible
+  for (nm in names(cfg$optional_cols)) {
+    o <- cfg$optional_cols[[nm]]
+    if (o$type != "numeric" || o$binder == "blank") next
+    a <- aggregate(list(val = b[[nm]]),
+                   by = list(master_ref = b$master_ref, limit_band = b$limit_band),
+                   FUN = function(x) rollup(x, o$binder))
+    names(a)[names(a) == "val"] <- paste0(o$binder, "_", nm)
+    prof <- merge(prof, a, by = c("master_ref", "limit_band"), all.x = TRUE)
+  }
   prof$limit_band <- factor(as.character(prof$limit_band), levels = levels(b$limit_band))
   prof <- prof[order(prof$master_ref, prof$limit_band), ]
   prof$avg_premium_per_dec <- round(prof$gn_premium / prof$n_decs, 2)
@@ -219,17 +272,21 @@ consolidate <- function(df, cfg) {
                     n_underlying = rep(1L, nrow(ind)),
                     limit = ind$limit, gn_premium = ind$gn_premium,
                     stringsAsFactors = FALSE)
+  for (nm in names(cfg$optional_cols)) out[[nm]] <- ind[[nm]]
 
   b <- df[is_b & !is.na(df$master_ref), , drop = FALSE]
   if (nrow(b)) {
     bout <- do.call(rbind, lapply(split(b, b$master_ref), function(x) {
       mx <- suppressWarnings(max(x$limit, na.rm = TRUE))
-      data.frame(policy_ref = x$master_ref[1], policy_type = tl$binder,
-                 record_basis = "Dec profile (binder master)",
-                 n_underlying = nrow(x),
-                 limit = if (is.finite(mx)) mx else NA_real_,   # max dec limit
-                 gn_premium = sum_na(x$gn_premium),
-                 stringsAsFactors = FALSE)
+      r <- data.frame(policy_ref = x$master_ref[1], policy_type = tl$binder,
+                      record_basis = "Dec profile (binder master)",
+                      n_underlying = nrow(x),
+                      limit = if (is.finite(mx)) mx else NA_real_,   # max dec limit
+                      gn_premium = sum_na(x$gn_premium),
+                      stringsAsFactors = FALSE)
+      for (nm in names(cfg$optional_cols))
+        r[[nm]] <- rollup(x[[nm]], cfg$optional_cols[[nm]]$binder)
+      r
     }))
     out <- rbind(out, bout)
   }
@@ -258,6 +315,8 @@ classify <- function(con_exp, con_cur, cfg) {
   con_cur$expiring_policy_type <- con_exp$policy_type[me]
   con_cur$expiring_limit       <- con_exp$limit[me]
   con_cur$expiring_gn_premium  <- con_exp$gn_premium[me]
+  for (nm in names(cfg$optional_cols))
+    con_cur[[paste0("expiring_", nm)]] <- con_exp[[nm]][me]
   con_cur$premium_change_pct   <- ifelse(!is.na(me) & con_cur$expiring_gn_premium > 0,
     round(100 * (con_cur$gn_premium / con_cur$expiring_gn_premium - 1), 1), NA)
   con_cur$type_changed <- !is.na(me) &
@@ -330,8 +389,8 @@ compare_profiles <- function(prof_exp, prof_cur, cfg) {
 
 # ---- 7. PIPELINE ------------------------------------------------------------
 run_analysis <- function(expiring_raw, current_raw, cfg) {
-  exp <- standardise(expiring_raw, cfg)
-  cur <- standardise(current_raw,  cfg)
+  exp <- standardise(expiring_raw, cfg, "Expiring")
+  cur <- standardise(current_raw,  cfg, "Current")
 
   issues <- rbind(validate_dataset(exp, "Expiring", cfg$expiring_yoa, cfg),
                   validate_dataset(cur, "Current",  cfg$current_yoa,  cfg))
@@ -396,7 +455,11 @@ make_dummy_data <- function(cfg, seed = 2026) {
     data.frame(policy_ref = mk_ref(prefix, yoa, idx), master_ref = NA_character_,
                policy_type = type, insured = paste("Insured", prefix, idx),
                limit = sample(lims[3:8], n, TRUE),
-               gn_premium = round(runif(n, 1e4, 4e5)), stringsAsFactors = FALSE)
+               gn_premium = round(runif(n, 1e4, 4e5)),
+               stack_code = sprintf("STK%03d", sample(1:25, n, TRUE)),
+               deductible = sample(c(1e4, 2.5e4, 5e4, 1e5), n, TRUE),
+               participation = sample(c(.1, .2, .25, .5, 1), n, TRUE),
+               stringsAsFactors = FALSE)
   }
   mk_binder <- function(master, yoa, n, start) {
     idx <- start + seq_len(n) - 1
@@ -404,6 +467,9 @@ make_dummy_data <- function(cfg, seed = 2026) {
     data.frame(policy_ref = mk_ref("DEC", yoa, idx), master_ref = master,
                policy_type = tl$binder, insured = paste("Dec insured", idx),
                limit = lim, gn_premium = round(lim * runif(n, .002, .012)),
+               stack_code = NA_character_,                    # blank for decs
+               deductible = sample(c(1e3, 2.5e3, 5e3, 1e4), n, TRUE),
+               participation = sample(c(.25, .5, 1), 1),      # same line on all decs
                stringsAsFactors = FALSE)
   }
   mk_binders <- function(masters, yoa, start = 1) {
