@@ -25,16 +25,17 @@
 # Base R only (no packages needed). If {openxlsx} is installed, a single
 # Excel workbook is also written alongside the CSVs.
 #
-# To use real data: set cfg$use_dummy <- FALSE, point cfg$expiring_file /
-# cfg$current_file at your files, and edit cfg$col_map / cfg$type_labels to
-# match your column names and policy-type values.
+# To use real data: run policy_renewal_import.R first. It reads the Excel
+# exports, matches the columns and policy types, and writes input/expiring.csv
+# and input/current.csv in the standard layout below. Then set
+# cfg$use_dummy <- FALSE here and run this script.
 # =============================================================================
 
 # ---- 0. CONFIGURATION -------------------------------------------------------
 cfg <- list(
   use_dummy     = TRUE,
-  expiring_file = "expiring.csv",
-  current_file  = "current.csv",
+  expiring_file = "input/expiring.csv",   # written by policy_renewal_import.R
+  current_file  = "input/current.csv",
   output_dir    = "output",
 
   # Standard name used in this script = column name in YOUR data
@@ -58,7 +59,7 @@ cfg <- list(
     participation = list(col = "participation", type = "numeric", binder = "mean")
   ),
 
-  # Values of the policy-type field in YOUR data
+  # Policy-type values (keep the same as imp_cfg$type_labels in the import)
   type_labels = list(
     open_market = "Open Market",
     lineslip    = "Lineslip Declaration",
@@ -521,9 +522,14 @@ if (cfg$use_dummy) {
   write.csv(expiring_raw, file.path(cfg$output_dir, "dummy_input_expiring.csv"), row.names = FALSE, na = "")
   write.csv(current_raw,  file.path(cfg$output_dir, "dummy_input_current.csv"),  row.names = FALSE, na = "")
 } else {
-  # For Excel input: expiring_raw <- readxl::read_excel("expiring.xlsx", sheet = 1)
-  expiring_raw <- read.csv(cfg$expiring_file, stringsAsFactors = FALSE, check.names = FALSE)
-  current_raw  <- read.csv(cfg$current_file,  stringsAsFactors = FALSE, check.names = FALSE)
+  # Standardised CSVs from policy_renewal_import.R (read as text so references
+  # keep leading zeros; numbers are parsed in standardise())
+  for (f in c(cfg$expiring_file, cfg$current_file))
+    if (!file.exists(f)) stop("Input not found: ", f, " - run policy_renewal_import.R first")
+  expiring_raw <- read.csv(cfg$expiring_file, colClasses = "character", na.strings = c("", "NA"),
+                           check.names = FALSE)
+  current_raw  <- read.csv(cfg$current_file,  colClasses = "character", na.strings = c("", "NA"),
+                           check.names = FALSE)
 }
 
 res <- run_analysis(expiring_raw, current_raw, cfg)
