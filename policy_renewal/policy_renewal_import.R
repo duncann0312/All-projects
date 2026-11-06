@@ -12,7 +12,7 @@
 #   3. Scores every column against each field using its NAME (synonyms) and
 #      CONTENT (reference pattern, uniqueness, numeric values) and picks the
 #      best match. Required: policy_ref, master_ref, limit, gn_premium.
-#      Optional: stack_code, deductible, participation.
+#      Optional: stack_code, deductible, participation, class_of_business.
 #   4. Picks the best policy-type column (header + values) and suggests which
 #      standard type each distinct value maps to.
 #   5. Writes:
@@ -102,7 +102,11 @@ FIELD_SPEC <- list(
     syn  = c("participation", "participationpct", "signedline", "signedlinepct",
              "writtenline", "writtenlinepct", "ourshare", "ourline", "signedshare",
              "share", "line", "linesize", "linepct"),
-    weak = character(), neg = "slip|limit|premium")
+    weak = character(), neg = "slip|limit|premium"),
+  class_of_business = list(required = FALSE, kind = "text",
+    syn  = c("classofbusiness", "class", "cob", "businessclass", "lineofbusiness", "lob",
+             "classname", "majorclass", "subclass", "classcode"),
+    weak = character(), neg = "type|basis")
 )
 
 TYPE_SYN  <- c("policytype", "risktype", "contracttype", "placementtype", "placementbasis",
@@ -391,25 +395,27 @@ make_demo_workbooks <- function(cfg) {
   set.seed(11)
   ref  <- function(p, y, i) sprintf("%s%s%05d", p, y, i)
   roll <- function(x) { substr(x, 4, 5) <- sprintf("%02d", as.integer(substr(x, 4, 5)) + 1); x }
-  rec  <- function(pref, master, type, lim, ded, line, stack) {
+  classes <- c("Property D&F", "Marine Cargo", "Energy Onshore", "Terrorism", "Casualty")
+  rec  <- function(pref, master, type, lim, ded, line, stack, cob) {
     n <- length(pref)
     data.frame("Risk Reference" = pref, "Master UMR" = master, "Placement Basis" = type,
                "Insured Name" = paste("Insured", pref), "Underwriter" = sample(c("AB", "CD", "EF"), n, TRUE),
                "Limit 100%" = lim, "GNP (USD)" = round(lim * runif(n, .002, .012)),
                "Premium Tax" = round(runif(n, 100, 5000)), "Stack Code" = stack,
-               "Excess" = ded, "Signed Line %" = line,
+               "Excess" = ded, "Signed Line %" = line, "Class of Business" = cob,
                check.names = FALSE, stringsAsFactors = FALSE)
   }
   ind <- function(p, y, i, type) {
     n <- length(i)
     rec(ref(p, y, i), NA_character_, type, sample(c(1e6, 2e6, 5e6, 1e7, 2.5e7), n, TRUE),
         sample(c(1e4, 2.5e4, 5e4), n, TRUE), sample(c(10, 25, 50, 100), n, TRUE),
-        sprintf("STK%03d", sample(1:20, n, TRUE)))
+        sprintf("STK%03d", sample(1:20, n, TRUE)), sample(classes, n, TRUE))
   }
   decs <- function(master, y, i, type) {
     n <- length(i)
     rec(ref("DEC", y, i), master, type, sample(c(2.5e5, 5e5, 1e6, 2e6), n, TRUE),
-        sample(c(1e3, 2.5e3, 5e3), n, TRUE), rep(sample(c(25, 50, 100), 1), n), NA_character_)
+        sample(c(1e3, 2.5e3, 5e3), n, TRUE), rep(sample(c(25, 50, 100), 1), n), NA_character_,
+        sample(c("Property Binder", "Property D&F"), n, TRUE, prob = c(.8, .2)))
   }
   # Expiring: labels as one system writes them; block entries are YOA 24
   e_ind <- rbind(ind("OMK", "25", 1:20, "Open Market"), ind("LSD", "25", 1:8, "Line Slip Dec"),
@@ -443,6 +449,13 @@ make_demo_workbooks <- function(cfg) {
       writexl::write_xlsx(list(Notes = data.frame(note = "Demo export"), "Risk Data" = df), path)
     }
   }
+  # Demo curves file (only if you don't already have one)
+  cpath <- file.path(cfg$input_dir, "curves.csv")
+  if (!file.exists(cpath))
+    write.csv(data.frame(curve_id = c("CRV_PROP", "CRV_MAR", "CRV_ENG", "CRV_TERR"),
+                         classes  = c("Property D&F; Property Binder", "Marine Cargo",
+                                      "Energy Onshore, Energy Offshore", "Terrorism | Property D&F")),
+              cpath, row.names = FALSE)
   message("Demo workbooks written to ", normalizePath(cfg$input_dir))
   files
 }

@@ -12,7 +12,13 @@
 #     be unique -> checked and reported.
 #   * Optional fields (cfg$optional_cols) are carried through to the outputs:
 #     stack_code (blank for binder masters), deductible (average of decs for
-#     binders) and participation (average of decs for binders).
+#     binders), participation (average of decs for binders) and
+#     class_of_business (most common class across decs for binders).
+#
+# Stage 3 - Exposure curve reference
+#   * A curves CSV lists each curve_id with the classes it applies to.
+#   * Every record in expiring_status / current_status gets the curve_id whose
+#     class list contains the record's class_of_business.
 #
 # Stage 2 - Renewal status
 #   * Year of account (YOA) is held in characters 4-5 of the reference.
@@ -51,12 +57,26 @@ cfg <- list(
   #   col    = column name in YOUR data (if absent, the field is left blank)
   #   type   = "text" or "numeric"
   #   binder = how binder declarations roll up to the master / Dec profile band:
-  #            "blank", "mean", "sum", "max" or "first"
+  #            "blank", "mean", "sum", "max", "first" or "mode" (most common)
   # Delete an entry to drop the field from the outputs; add entries for more.
   optional_cols = list(
     stack_code    = list(col = "stack_code",    type = "text",    binder = "blank"),
     deductible    = list(col = "deductible",    type = "numeric", binder = "mean"),
-    participation = list(col = "participation", type = "numeric", binder = "mean")
+    participation = list(col = "participation", type = "numeric", binder = "mean"),
+    class_of_business = list(col = "class_of_business", type = "text", binder = "mode")
+  ),
+
+  # Exposure curve lookup. The curves CSV has one row per curve: a curve id
+  # column and a column listing the classes it applies to, separated by ; , or |
+  # e.g.  curve_id = "CRV_PROP", classes = "Property D&F; Property Binder"
+  # Classes are matched ignoring case, spaces and punctuation.
+  curves = list(
+    file          = "input/curves.csv",
+    id_col        = "curve_id",
+    classes_col   = "classes",            # if absent and the file has 2 columns, the other is used
+    class_field   = "class_of_business",  # policy field looked up in the class lists
+    delimiter     = "[;,|]",
+    default_curve = NA                    # curve_id for unmatched classes, or NA to leave blank
   ),
 
   # Policy-type values (keep the same as imp_cfg$type_labels in the import)
@@ -141,6 +161,7 @@ rollup <- function(x, rule) {
          sum   = sum(x, na.rm = TRUE),
          max   = max(x, na.rm = TRUE),
          first = x[!is.na(x)][1],
+         mode  = { t <- table(x); names(t)[which.max(t)] },
          stop("Unknown binder roll-up rule: ", rule))
 }
 
@@ -389,7 +410,89 @@ compare_profiles <- function(prof_exp, prof_cur, cfg) {
 }
 
 # ---- 7. PIPELINE ------------------------------------------------------------
-run_analysis <- function(expiring_raw, current_raw, cfg) {
+# ---- 6b. STAGE 3 - EXPOSURE CURVES ------------------------------------------
+class_key <- function(x) {
+  k <- gsub("[^a-z0-9]", "", tolower(as.character(x)))
+  k[!is.na(k) & !nzchar(k)] <- NA
+  k
+}
+
+# Curves file -> long lookup: one row per (curve_id, class)
+build_curve_lookup <- function(curves, cfg) {
+  cc <- cfg$curves
+  if (is.null(curves) || !nrow(curves)) return(NULL)
+  if (!cc$id_col %in% names(curves))
+    stop("Curves file has no '", cc$id_col, "' column. Columns: ",
+         paste(names(curves), collapse = ", "))
+  cls_col <- cc$classes_col
+  if (!cls_col %in% names(curves)) {
+    others <- setdiff(names(curves), cc$id_col)
+    if (length(others) != 1)
+      stop("Curves file: classes column '", cls_col, "' not found. Columns: ",
+           paste(names(curves), collapse = ", "), " - set cfg$curves$classes_col")
+    message("Curves file: using '", others, "' as the classes column")
+    cls_col <- others
+  }
+  parts <- strsplit(as.character(curves[[cls_col]]), cc$delimiter)
+  ids   <- trimws(as.character(curves[[cc$id_col]]))
+  long  <- data.frame(curve_id = rep(ids, lengths(parts)),
+                      class = trimws(unlist(parts)), stringsAsFactors = FALSE)
+  long$class_key <- class_key(long$class)
+  long <- long[!is.na(long$class_key) & !is.na(long$curve_id) & nzchar(long$curve_id), ]
+  long <- long[!duplicated(long[c("curve_id", "class_key")]), ]
+  long$n_curves_for_class <- as.integer(table(long$class_key)[long$class_key])
+  long$used <- !duplicated(long$class_key)       # first curve listed wins
+  rownames(long) <- NULL
+  long
+}
+
+attach_curves <- function(df, lookup, cfg) {
+  cf  <- cfg$curves$class_field
+  cls <- if (cf %in% names(df)) df[[cf]] else rep(NA_character_, nrow(df))
+  if (is.null(lookup)) {
+    df$curve_id <- NA_character_; df$curve_match <- "No curves file"
+    return(df)
+  }
+  use <- lookup[lookup$used, ]
+  k   <- match(class_key(cls), use$class_key)
+  df$curve_id    <- use$curve_id[k]
+  df$curve_match <- ifelse(is.na(cls), "No class on record",
+                    ifelse(is.na(k), "No curve for class",
+                    ifelse(use$n_curves_for_class[k] > 1,
+                           "Matched (class on several curves - first used)", "Matched")))
+  dc <- cfg$curves$default_curve
+  if (!is.na(dc)) {
+    fill <- is.na(df$curve_id)
+    df$curve_id[fill]    <- dc
+    df$curve_match[fill] <- paste(df$curve_match[fill], "- default curve")
+  }
+  df
+}
+
+curve_issues <- function(df, label, cfg) {
+  bad <- df[!grepl("^Matched", df$curve_match) & df$curve_match != "No curves file", ]
+  if (!nrow(bad)) return(issue_template)
+  data.frame(dataset = label, check = paste("Exposure curve:", sub(" - default curve", "", bad$curve_match)),
+             row_id = NA_integer_, policy_ref = bad$policy_ref, master_ref = NA_character_,
+             policy_type = bad$policy_type,
+             detail = paste0("Class: ", bad[[cfg$curves$class_field]],
+                             ifelse(is.na(cfg$curves$default_curve), "",
+                                    paste(" - default", cfg$curves$default_curve, "used"))),
+             stringsAsFactors = FALSE)
+}
+
+summarise_curves <- function(df, label) {
+  d <- data.frame(curve_id = ifelse(is.na(df$curve_id), "(no curve)", df$curve_id),
+                  status = df$status, records = 1L, gn_premium = df$gn_premium,
+                  stringsAsFactors = FALSE)
+  a <- aggregate(cbind(records, gn_premium) ~ curve_id + status, data = d,
+                 FUN = sum_na, na.action = na.pass)
+  a <- a[order(a$curve_id, a$status), ]
+  rownames(a) <- NULL
+  cbind(dataset = label, a, stringsAsFactors = FALSE)
+}
+
+run_analysis <- function(expiring_raw, current_raw, cfg, curves_raw = NULL) {
   exp <- standardise(expiring_raw, cfg, "Expiring")
   cur <- standardise(current_raw,  cfg, "Current")
 
@@ -414,6 +517,24 @@ run_analysis <- function(expiring_raw, current_raw, cfg) {
       warning(nm, " consolidated set still has duplicate keys - see check_issues")
   }
 
+  # Stage 3 - exposure curve reference
+  lookup <- build_curve_lookup(curves_raw, cfg)
+  cls$expiring <- attach_curves(cls$expiring, lookup, cfg)
+  cls$current  <- attach_curves(cls$current,  lookup, cfg)
+  if (!is.null(lookup)) {
+    issues <- rbind(issues, curve_issues(cls$expiring, "Expiring", cfg),
+                    curve_issues(cls$current, "Current", cfg))
+    dup <- lookup[lookup$n_curves_for_class > 1, ]
+    if (nrow(dup)) {
+      first <- lookup$curve_id[lookup$used][match(dup$class_key, lookup$class_key[lookup$used])]
+      issues <- rbind(issues, data.frame(
+        dataset = "Curves", check = "Class listed on several curves", row_id = NA_integer_,
+        policy_ref = NA_character_, master_ref = NA_character_, policy_type = NA_character_,
+        detail = paste0("Class '", dup$class, "' on ", dup$curve_id, " - ", first, " used"),
+        stringsAsFactors = FALSE))
+    }
+  }
+
   list(
     check_issues          = issues,
     check_issue_summary   = if (nrow(issues))
@@ -427,7 +548,10 @@ run_analysis <- function(expiring_raw, current_raw, cfg) {
     current_status        = cls$current,
     status_summary        = rbind(summarise_status(cls$expiring, "Expiring"),
                                   summarise_status(cls$current,  "Current")),
-    reconciliation        = reconcile(cls)
+    reconciliation        = reconcile(cls),
+    curve_lookup          = lookup,
+    curve_summary         = rbind(summarise_curves(cls$expiring, "Expiring"),
+                                  summarise_curves(cls$current,  "Current"))
   )
 }
 
@@ -450,6 +574,7 @@ make_dummy_data <- function(cfg, seed = 2026) {
   lims <- c(2.5e5, 5e5, 1e6, 2e6, 5e6, 1e7, 2.5e7, 5e7)
   # Reference format: 3-char prefix + 2-char YOA (chars 4-5) + 5-digit number
   mk_ref <- function(prefix, yoa, idx) sprintf("%s%s%05d", prefix, yoa, idx)
+  classes <- c("Property D&F", "Marine Cargo", "Energy Onshore", "Terrorism", "Casualty")
 
   mk_ind <- function(prefix, type, yoa, idx) {
     n <- length(idx)
@@ -460,6 +585,7 @@ make_dummy_data <- function(cfg, seed = 2026) {
                stack_code = sprintf("STK%03d", sample(1:25, n, TRUE)),
                deductible = sample(c(1e4, 2.5e4, 5e4, 1e5), n, TRUE),
                participation = sample(c(.1, .2, .25, .5, 1), n, TRUE),
+               class_of_business = sample(classes, n, TRUE),
                stringsAsFactors = FALSE)
   }
   mk_binder <- function(master, yoa, n, start) {
@@ -471,6 +597,8 @@ make_dummy_data <- function(cfg, seed = 2026) {
                stack_code = NA_character_,                    # blank for decs
                deductible = sample(c(1e3, 2.5e3, 5e3, 1e4), n, TRUE),
                participation = sample(c(.25, .5, 1), 1),      # same line on all decs
+               class_of_business = sample(c("Property Binder", "Property D&F"), n, TRUE,
+                                          prob = c(.8, .2)),
                stringsAsFactors = FALSE)
   }
   mk_binders <- function(masters, yoa, start = 1) {
@@ -513,12 +641,22 @@ make_dummy_data <- function(cfg, seed = 2026) {
   list(expiring = expiring, current = current)
 }
 
+# Demo curves: "Casualty" has no curve, "Property D&F" is on two curves
+make_dummy_curves <- function() {
+  data.frame(curve_id = c("CRV_PROP", "CRV_MAR", "CRV_ENG", "CRV_TERR"),
+             classes  = c("Property D&F; Property Binder", "Marine Cargo",
+                          "Energy Onshore, Energy Offshore", "Terrorism | Property D&F"),
+             stringsAsFactors = FALSE)
+}
+
 # ---- 9. MAIN ----------------------------------------------------------------
 if (cfg$use_dummy) {
   d <- make_dummy_data(cfg)
   expiring_raw <- d$expiring
   current_raw  <- d$current
+  curves_raw   <- make_dummy_curves()
   dir.create(cfg$output_dir, showWarnings = FALSE, recursive = TRUE)
+  write.csv(curves_raw, file.path(cfg$output_dir, "dummy_input_curves.csv"), row.names = FALSE)
   write.csv(expiring_raw, file.path(cfg$output_dir, "dummy_input_expiring.csv"), row.names = FALSE, na = "")
   write.csv(current_raw,  file.path(cfg$output_dir, "dummy_input_current.csv"),  row.names = FALSE, na = "")
 } else {
@@ -530,9 +668,16 @@ if (cfg$use_dummy) {
                            check.names = FALSE)
   current_raw  <- read.csv(cfg$current_file,  colClasses = "character", na.strings = c("", "NA"),
                            check.names = FALSE)
+  if (file.exists(cfg$curves$file)) {
+    curves_raw <- read.csv(cfg$curves$file, colClasses = "character", na.strings = c("", "NA"),
+                           check.names = FALSE, fileEncoding = "UTF-8-BOM")
+  } else {
+    message("No curves file at ", cfg$curves$file, " - curve_id will be blank")
+    curves_raw <- NULL
+  }
 }
 
-res <- run_analysis(expiring_raw, current_raw, cfg)
+res <- run_analysis(expiring_raw, current_raw, cfg, curves_raw)
 
 cat("\n==== STAGE 1: CHECK ISSUES ====\n")
 if (is.null(res$check_issue_summary)) cat("No issues found.\n") else
@@ -546,5 +691,8 @@ print(res$status_summary, row.names = FALSE)
 
 cat("\n==== STAGE 2: RECONCILIATION ====\n")
 print(format(res$reconciliation, big.mark = ",", scientific = FALSE), row.names = FALSE)
+
+cat("\n==== STAGE 3: EXPOSURE CURVE ALLOCATION ====\n")
+print(res$curve_summary, row.names = FALSE)
 
 write_outputs(res, cfg$output_dir)
